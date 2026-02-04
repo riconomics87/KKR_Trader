@@ -549,6 +549,11 @@ class OrderStateDict:
         async with self.lock:
             return self.order_state_dict['sell_allowed']
 
+    async def get_buy_pending(self):
+        async with self.lock:
+            return self.order_state_dict['buy_pending']
+
+
     async def get_hold(self):
         async with self.lock:
             return self.order_state_dict['hold']
@@ -646,10 +651,11 @@ class OrderManager:
         self._orders: set[str] = set()
 
     def order_ack(self, msg: dict) -> None:
+        return
         if msg.get("success"):
             self._orders.add(msg["result"]["order_id"])
 
-    def ack_check(self, exec_: dict, order_confirmation: str = True) -> bool:
+    def ack_check(self, exec_: dict, order_confirmation: str = True) -> bool: #ack_check(entry, False)
         orders = self._orders
         oid = exec_.get("order_id")
         if oid in orders:
@@ -675,7 +681,7 @@ class OrderManager:
                      
                         #await self.market_order_take_profit()
                         if self.entry_by in {1,2}:
-                            order_response = await self.market_buy_order()
+                            order_response = await self.market_buy_order_w_stop_loss()
                             self.order_ack(order_response)
                         #order_response = ""
                         #self.order_id = order_response["result"]["order_id"]
@@ -810,7 +816,7 @@ class OrderManager:
     async def market_buy_order_w_stop_loss(self, req_id = 10002): 
         self.allotment_id, allocation = await allocator.lock_allotment()# session_balance / 10 #await allocator.lock_allotment(self.slot)
         if allocation == 0:
-            return
+            return {}
         base_units, quote_units = await self.calculate_order_qty(allocation)
         stop_loss_pct = candlesDict[self.asset].stop_dist
         if quote_units > 2:
@@ -833,9 +839,10 @@ class OrderManager:
                                       },
                          }
 
-            #await send_message(private_ws.ws, order_data)
+            #return await send_message(private_ws.ws, order_data)
         else:
             await allocator.release_allotment(self.allotment_id)
+            return {}
 
     async def market_buy_order_w_trailing_stop_loss(self, req_id = 10003): 
         self.allotment_id, allocation = await allocator.lock_allotment()# session_balance / 10 #await allocator.lock_allotment(self.slot)
@@ -1355,7 +1362,7 @@ async def print_leaderboard():
             print(datetime.now(timezone.utc), '--------------------------------------------------------------------')
             print('INTERVALS:',interval_seconds)
 
-            print(current_system_state, 'USD BALANCE:', balances.usd)
+            #print(current_system_state, 'USD BALANCE:', balances.usd)
             print(pub_restart, pri_restart, trd_restart)#, bk_restart)
             print(ldf.to_string(index=False))
             #print()
@@ -1532,6 +1539,8 @@ async def slot_trader():
     #await system_log("Slot Trader", "STOPPED     ")
     #return
 
+q = asyncio.Queue(maxsize=50_000)
+
 async def log(message, custom_timestamp = None, use_date = True):    
     # Convert UTC time to local time (EST/EDT)
     now = time.localtime()  # local time from system clock
@@ -1625,145 +1634,6 @@ class Journal:
                 await f.write(line)
 
 journal = Journal("trade_journals")
-''
-async def new_execution_id(exec_id, timestamp_str):
-    """
-    Load recent exec_ids from external file, check for duplicates,
-    append new ID, and keep file size limited to max_seen_lines.
-    
-    Returns:
-        bool: True if exec_id is new (not seen), False if duplicate.
-    """
-    seen_file = "/root/logs/seen_exec_ids.txt" if os.name == 'posix' else "seen_exec_ids.txt"
-    max_seen_lines = 100  # Keep only the most recent 100k exec_ids
-
-    # In-memory last seen timestamp (initialized with today 00:00 UTC on first call)
-    if not hasattr(new_execution_id, "last_seen_ts"):
-        today = datetime.now(timezone.utc).date() #- timedelta(years=2)  #datetime(2018, 5, 1) #
-        new_execution_id.last_seen_ts = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
-
-    # You must have the timestamp string available here, e.g.:
-    # exec_timestamp_str = "2025-05-01T01:22:22.584722Z"   # ← put your real timestamp here
-    exec_ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-
-    if exec_ts <= new_execution_id.last_seen_ts:
-        return False
-
-    # ---- load recent seen IDs (limit size) ------------------------------
-    seen_ids = set()
-    if os.path.exists(seen_file):
-        #async with aiofiles.open(seen_file, mode='r') as f:
-        with open(seen_file, 'r') as f:
-            lines = f.readlines()
-        # Keep only the last max_seen_lines
-        recent_lines = lines[-max_seen_lines:]
-        seen_ids = {line.strip() for line in recent_lines if line.strip()}
-
-    # ---- duplicate guard ------------------------------------------------
-    if not exec_id or exec_id in seen_ids:
-        return False  # Duplicate
-
-    # ---- append new ID and trim file ------------------------------------
-    #async with aiofiles.open(seen_file, mode='a', buffering=1) as f:
-    with open(seen_file, 'a', buffering=1) as f:
-        f.write(exec_id + '\n')
-
-    # Trim file if it grew beyond limit
-    if len(seen_ids) >= max_seen_lines:
-        #async with aiofiles.open(seen_file, mode='r') as f:
-        with open(seen_file, 'r') as f:
-            all_lines = f.readlines()
-        #async with aiofiles.open(seen_file, mode='w') as f:
-        with open(seen_file, 'w') as f:
-            f.writelines(all_lines[-max_seen_lines:])
-
-    #new_execution_id.last_seen_ts = exec_ts   # update only when accepted
-    return True  # New ID
-
-class ExecutionsLogFileManager:
-    def __init__(self, log_file_base='executions.log', max_file_size=100 * 1024 * 1024, backup_count=5):
-        """Initialize the log file manager with configuration."""
-        self.log_file_base = log_file_base  # Base filename (e.g., 'executions.log')
-        self.max_file_size = max_file_size  # Max size in bytes (default: 100 MB)
-        self.backup_count = backup_count
-        self.current_date = time.strftime('%Y-%m-%d', time.localtime())  # Track current date
-        self.log_file = self._get_log_file_path()  # Initialize log file path
-        self.initialize_log_file()  # Ensure file exists with header
-        self.lock = asyncio.Lock()                   
-
-    def _get_log_file_path(self):
-        """Generate log file path with current date and POSIX prefix if applicable."""
-        now = time.localtime()
-        date_str = time.strftime('%Y-%m-%d', now)
-        log_file = f"{date_str}_{self.log_file_base}"
-        if os.name == 'posix':
-            log_file = os.path.join("/root/logs", log_file)
-        return log_file
-
-    def initialize_log_file(self):
-        """Create the log file with header if it doesn't exist."""
-        if os.name == 'posix':
-            os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
-        if not os.path.exists(self.log_file):
-            with open(self.log_file, 'w', buffering=1) as f:  # Line buffering
-                f.write("EXECUTIONS LOG\n\n")
-                f.write("DATE      \tTIME    \tTYPE          \tMESSAGE\n")
-                                                             
-    def rotate_log_file(self):
-        """Rotate the log file if it exceeds max_file_size."""
-        if os.path.exists(self.log_file) and os.path.getsize(self.log_file) >= self.max_file_size:
-            # Shift existing backup files (e.g., .4 -> .5, .3 -> .4)
-            for i in range(self.backup_count - 1, 0, -1):
-                old_file = f"{self.log_file}.{i}"
-                new_file = f"{self.log_file}.{i + 1}"
-                if os.path.exists(old_file):
-                    os.rename(old_file, new_file)
-            # Rename current log to .1
-            if os.path.exists(self.log_file):
-                os.rename(self.log_file, f"{self.log_file}.{1}")
-            # Create new log file with header
-            self.initialize_log_file()
-
-    async def format_log_message(self, message_type, message_data):
-        """Format the log message with provided req_id."""
-        now = time.localtime()  # local time from system clock
-        timestamp = time.strftime('%Y-%m-%d %H:%M:%S', now)
-        date_str, time_str = timestamp.split(' ')  # Split into DATE and TIME
-        
-        # Convert message data to JSON string
-        #message_json = json.dumps(message_data)
-        message_json = orjson.dumps(message_data, ensure_ascii=False, indent=None)
-
-
-        # Format: DATE (10 chars), TIME (8 chars), TYPE (14 chars), MESSAGE
-        return f"{date_str:<10}\t{time_str:<8}\t{message_type:<14}\t{message_json}"
-
-    async def write_to_log(self, message_type, message_data):
-        async with lock_manager.acquire('executions_log'):
-            now = time.localtime()
-            new_date = time.strftime('%Y-%m-%d', now)
-            if new_date != self.current_date:
-                self.current_date = new_date
-                self.log_file = self._get_log_file_path()
-                self.initialize_log_file()  # Create new file for new date
-
-            self.rotate_log_file()  # Check and rotate if needed
-        
-            line = await self.format_log_message(message_type, message_data)
-        
-            try:                
-                async with aiofiles.open(self.log_file, mode='a', encoding="utf-8") as f:
-                #with open(self.log_file, 'a', buffering=1) as f:  # Line buffering
-                    #f.write(line + '\n')
-                    await f.write(f'{line}\n')
-                return line
-            except Exception as e:
-                print(f"Error writing to file: {e}")
-                await asyncio.sleep(1)
-                return None
-        #async with lock_manager.acquire('executions_log'):
-        #    async with aiofiles.open(self.log_file, mode='a', buffering=1) as f:
-executions_log_manager = ExecutionsLogFileManager()  # Create instance of ExecutionsLogFileManager
 
 class log_Candles:
     __slots__ = (
@@ -1869,6 +1739,8 @@ class log_Candles:
             'entry_by',
             'max_rolling_spread',
             'in_slots',
+            'spreads',
+            'spread_sum',
         )
     def __init__(self, info, restart=False):
         self.istrending = False
@@ -1988,6 +1860,8 @@ class log_Candles:
         self.wstatus = 0
         self.last_wstatus = 0
         self.in_slots = False
+        self.spreads = deque()
+        self.spread_sum = 0.0       
    
     async def update(self, info):
         try:
@@ -2012,18 +1886,28 @@ class log_Candles:
 
                 self.ticks.append((self.timestamp, self.mid, self.bid, self.ask, 0, 0)) #0 for volume
 
+                spread = (self.ask - self.bid) / ((self.ask + self.bid) / 2)
+                self.spreads.append(spread)
+                self.spread_sum += spread
+
                 cutoff_now = self.timestamp - interval_seconds
                 #cutoff_now = time.time() - interval_seconds 
                 while self.ticks and self.ticks[0][0] < cutoff_now:                      
                     self.ticks.popleft()
+                    old_spread = self.spreads.popleft()
+                    self.spread_sum -= old_spread
 
                 if self.ticks:                      
                     self.intervals = self.timestamp - self.ticks[0][0]
-                 
+                    '''
                     spreads_period = [(t[3] - t[2]) / ((t[3] + t[2]) / 2) for t in self.ticks]
                     self.spread_bps = sum(spreads_period) / len(spreads_period)  #needed
                     self.max_rolling_spread = max([(t[3] - t[2]) / ((t[3] + t[2]) / 2) for t in self.ticks])
-                  
+                    '''
+                    if self.spreads:
+                        self.spread_bps = self.spread_sum / len(self.spreads)
+                        self.max_rolling_spread = max(self.spreads)   # can optimize further if needed
+
                     whigh = max([t[3] for t in self.ticks])  
                     wlow = min([t[1] for t in self.ticks])
 
@@ -2381,9 +2265,9 @@ async def Process_Public_Message(message):
                 for pairinfo in message['data']['pairs']:
                     if (pairinfo['status'] == 'online') and ("USD" not in pairinfo['symbol'].split('/')[0]) and ("USD" == pairinfo['symbol'].split('/')[1]) and not any(currency in pairinfo['symbol'] for currency in stablecoins):                       
                         #instrument_dict = {pairinfo['symbol'] : pairinfo}
-                        instrument_dict[pairinfo['symbol']] = pairinfo # < global update
-                        #print(pairinfo['symbol'])
-                       
+                        if pairinfo['symbol'] not in instrument_dict:
+                            instrument_dict[pairinfo['symbol']] = pairinfo # < global update
+
                         if pairinfo['symbol'] not in candlesDict:
                             init_candle = {"channel": "ticker","type":"update","data":[{"symbol": pairinfo['symbol'],"bid": 0,"bid_qty": 0,"ask": 0,"ask_qty": 0,"last": 0,"volume": 0,"vwap": 0,"low": 0,"high": 0,"change": 0,"change_pct": 0}]}
                             candlesDict[pairinfo['symbol']] = log_Candles(init_candle)
@@ -2501,26 +2385,22 @@ async def Process_Private_Message(message):
                             exec_id = entry.get('exec_id')
                             timestamp = entry.get('timestamp')
 
-
                             pair = entry.get("symbol", None)
                             order_state_set = set(await osd.get_all_order_state_list())
-                            if pair in order_state_set:
+                            sell_allowed = set(await osd.get_sell_allowed())
+                            buy_pending = set(await osd.get_buy_pending())
+                            if pair in sell_allowed | buy_pending: #if pair in order_state_set:
 
                                 if (pair != None) and pair not in order_manager:
                                     order_manager[pair] = OrderManager(pair)
                        
                                 if (pair != None) and (entry["exec_type"] == "trade"):                      
                                     await order_manager[pair].execution_response(message)
-                                    if order_manager[pair].current_order_future == None and entry["side"] == "buy":
-                                        await order_manager[pair].add_execution_entry(entry)
-                                        message_type = entry["exec_type"].replace("_", " ").upper()
-                                        await executions_log_manager.write_to_log(message_type, entry)
-                                    elif order_manager[pair].current_order_future != None and not order_manager[pair].current_order_future.done() and entry["side"] == "sell": 
-                                        await order_manager[pair].remove_execution_entry(pair)
-                                        message_type = entry["exec_type"].replace("_", " ").upper()
-                                        await executions_log_manager.write_to_log(message_type, entry)
-                            #else:
-                                #await asyncio.sleep(0)
+
+                                    if ((entry["side"] == "buy" and pair in buy_pending) or (entry["side"] == "sell" and pair in sell_allowed)) and order_manager[pair].ack_check(entry, False):
+                                        #save execution log
+                                        await order_manager[pair].execution_response(entry)
+
             if "error" in message:
                 await system_log(f"{message}", "WS PRI ERROR")
 
@@ -2792,12 +2672,12 @@ class KrakenTradesWS:
                             if self.has_sub:
                                 message = await ws.recv()
                                 await self.on_message(message, ws)
-                                if await timer.passed():
-                                    break
+                                #if await timer.passed():
+                                #    break
                                 #asyncio.create_task(self.on_message(message, ws))
                                 #print("Trades",message)
                             else:
-                                await asyncio.sleep(.1)
+                                await asyncio.sleep(0)
                         except websockets.exceptions.ConnectionClosed as e:
                             await ws_status.set_trades(0)
                             await system_log(f"{e.__traceback__.tb_lineno} TRDS WS inner error: Connection Closed Exception - {e}", "DISCONNECTED")
@@ -2874,7 +2754,7 @@ class KrakenPublicWS:
         await system_log("Public WS connected", "CONNECTED   ")
 
         global instrument_dict, subList
-        instrument_dict = {}
+        #instrument_dict = {}
 
         subs = [{
                     "method" : "subscribe",
@@ -2972,8 +2852,7 @@ class KrakenPublicWS:
                     while self.is_running:
                         try:
                             message = await ws.recv()
-                            #await self.on_message(message)
-                            asyncio.create_task(self.on_message(message))
+                            await self.on_message(message)
                         except websockets.exceptions.ConnectionClosed as e:
                             await ws_status.set_public(0)
                             await system_log(f"{e.__traceback__.tb_lineno} Public WS inner error: Connection Closed Exception - {e}", "DISCONNECTED")
@@ -3022,7 +2901,6 @@ class KrakenPublicWS:
             c = (c or []).__iadd__([v]) if m=="append" else (c or {}).update(v) or c if m=="update" else v
             setattr(self, key, c)
             return c
-
 # ----------------------------------------------------------------------
 #  PRIVATE WS  (independent restart)
 # ----------------------------------------------------------------------
